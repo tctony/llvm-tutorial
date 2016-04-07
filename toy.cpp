@@ -10,6 +10,16 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+
+#include "llvm/Analysis/Passes.h"
+#include "llvm/ExecutionEngine/ExecutionEngine.h"
+#include "llvm/ExecutionEngine/MCJIT.h"
+#include "llvm/ExecutionEngine/SectionMemoryManager.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/PassManager.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Transforms/Scalar.h"
+
 using namespace llvm;
 
 //= Lexer
@@ -65,20 +75,6 @@ static int gettok() {
   int ThisChar = LastChar;
   LastChar = getchar();
   return ThisChar;
-}
-
-static void printtok(int tok) {
-  std::string str;
-  switch (tok) {
-  case tok_eof: str = "eof"; break;
-  case tok_def: str = "def"; break;
-  case tok_extern: str = "extern"; break;
-  case tok_identifier: str = IdentifierStr; break;
-  case tok_number: str = IdentifierStr; break;
-  default: str = tok; break;
-  }
-
-  fprintf(stdout, "%s\n", str.c_str());
 }
 
 //= AST
@@ -142,7 +138,7 @@ namespace {
 
 //= Error
 ExprAST *Error(const char *str) { fprintf(stderr, "Error: %s\n", str); return 0; }
-PrototypeAST *ErrorP(const char *str) { ErrorP(str); return 0; }
+PrototypeAST *ErrorP(const char *str) { Error(str); return 0; }
 FunctionAST *ErrorF(const char *str) { Error(str); return 0; }
 Value *ErrorV(const char *str) { Error(str); return 0; }
 
@@ -309,8 +305,11 @@ static FunctionAST *ParseDefinition() {
 
 //== toplevelexpr ::= expression
 static FunctionAST *ParseTopLevelExpr() {
+  static int count = 0;
+  static char buffer[20];
   if (ExprAST *E = ParseExpression()) {
-    PrototypeAST *Proto = new PrototypeAST("", std::vector<std::string>());
+    sprintf(buffer, "_toplevelexpr_%d", count++);
+    PrototypeAST *Proto = new PrototypeAST(std::string(buffer), std::vector<std::string>());
     return new FunctionAST(Proto, E);
   }
   return 0;
@@ -326,11 +325,7 @@ static PrototypeAST *ParseExtern() {
 static Module *TheModule;
 static IRBuilder<> Builder(getGlobalContext());
 static std::map<std::string, Value *> NamedValues;
-
-static void initLLVM() {
-  LLVMContext &Context = getGlobalContext();
-  TheModule = new Module("my cool jit", Context);
-}
+static FunctionPassManager *TheFPM;
 
 Value *NumberExprAST::Codegen() {
   return ConstantFP::get(getGlobalContext(), APFloat(Val));
@@ -423,6 +418,8 @@ Function *FunctionAST::Codegen() {
 
     verifyFunction(*TheFunction);
 
+    TheFPM->run(*TheFunction);
+
     return TheFunction;
   }
 
@@ -431,6 +428,9 @@ Function *FunctionAST::Codegen() {
 }
 
 //= Top Level Parsing and JIT Driver
+
+static ExecutionEngine *TheExecutionEngine;
+
 static void HandleDefinition() {
   if (FunctionAST *F = ParseDefinition()) {
     if (Function *LF = F->Codegen()) {
@@ -458,6 +458,19 @@ static void HandleTopLevelExpression() {
     if (Function *LF = F->Codegen()) {
       fprintf(stderr, "Read top-level expression:");
       LF->dump();
+
+      TheExecutionEngine->finalizeObject();
+
+      void *FPtr = TheExecutionEngine->getPointerToFunction(LF); // only get right pointer on first call, wtf!
+      if (FPtr > 0) {
+        double (*FP)() = (double (*)())FPtr;
+        fprintf(stderr, "evaluated to %f\n", FP());
+      }
+      else {
+        char buffer[100];
+        sprintf(buffer, "get function address (%p) for %p", FPtr, (void *)LF);
+        ErrorF(buffer);
+      }
     }
   } else {
     getNextToken(); //  skip current token
@@ -494,13 +507,40 @@ double putchard(double X) {
 int main() {
   initBinopPrecedence();
 
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+  LLVMContext &Context = getGlobalContext();
+
+  std::unique_ptr<Module> Owner = make_unique<Module>("my cool jit", Context);
+  TheModule = Owner.get();
+
+  std::string ErrStr;
+  TheExecutionEngine = EngineBuilder(std::move(Owner))
+    .setErrorStr(&ErrStr)
+    .setMCJITMemoryManager(llvm::make_unique<SectionMemoryManager>())
+    .create();
+  if (!TheExecutionEngine) {
+    fprintf(stderr, "could not create ExecutionEngine: %s\n", ErrStr.c_str());
+    exit(1);
+  }
+
+  FunctionPassManager OurFPM(TheModule);
+  OurFPM.add(new DataLayoutPass());
+  OurFPM.add(createBasicAliasAnalysisPass());
+  OurFPM.add(createInstructionCombiningPass());
+  OurFPM.add(createReassociatePass());
+  OurFPM.add(createGVNPass());
+  OurFPM.add(createCFGSimplificationPass());
+  OurFPM.doInitialization();
+  TheFPM = &OurFPM;
+
   fprintf(stdout, "ready> ");
   getNextToken(); // Prime the first token
 
-  initLLVM();
-
   MainLoop();
 
+  TheFPM = 0;
   TheModule->dump();
 
   return 0;
