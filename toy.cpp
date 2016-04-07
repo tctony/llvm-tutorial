@@ -5,6 +5,13 @@
 #include <string>
 #include <vector>
 
+#include "llvm/IR/Verifier.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+using namespace llvm;
+
 //= Lexer
 enum Token {
   tok_eof = -1,
@@ -79,22 +86,30 @@ namespace {
   class ExprAST {
   public:
     virtual ~ExprAST() {}
+    virtual Value *Codegen() = 0;
   };
 
   class NumberExprAST : public ExprAST {
+    double Val;
   public:
-    NumberExprAST(double val) {}
+    NumberExprAST(double val) : Val(val) {}
+    virtual Value *Codegen();
   };
 
   class VariableExprAST : public ExprAST {
     std::string Name;
   public:
     VariableExprAST(const std::string &name) : Name(name) {}
+    virtual Value *Codegen();
   };
 
   class BinaryExprAST : public ExprAST {
+    char Op;
+    ExprAST *LHS, *RHS;
   public:
-    BinaryExprAST(char op, ExprAST *lhs, ExprAST *rhs) {}
+    BinaryExprAST(char op, ExprAST *lhs, ExprAST *rhs)
+      : Op(op), LHS(lhs), RHS(rhs) {}
+    virtual Value *Codegen();
   };
 
   class CallExprAST : public ExprAST {
@@ -103,6 +118,7 @@ namespace {
   public:
     CallExprAST(const std::string &callee, std::vector<ExprAST *> &args)
       : Callee(callee), Args(args) {}
+    virtual Value *Codegen();
   };
 
   class PrototypeAST {
@@ -111,13 +127,24 @@ namespace {
   public:
     PrototypeAST(const std::string &name, const std::vector<std::string> &args)
       : Name(name), Args(args) {}
+    Function *Codegen();
   };
 
   class FunctionAST {
+    PrototypeAST *Proto;
+    ExprAST *Body;
   public:
-    FunctionAST(PrototypeAST *proto, ExprAST *body) {}
+    FunctionAST(PrototypeAST *proto, ExprAST *body)
+      : Proto(proto), Body(body) {}
+    Function *Codegen();
   };
 }
+
+//= Error
+ExprAST *Error(const char *str) { fprintf(stderr, "Error: %s\n", str); return 0; }
+PrototypeAST *ErrorP(const char *str) { ErrorP(str); return 0; }
+FunctionAST *ErrorF(const char *str) { Error(str); return 0; }
+Value *ErrorV(const char *str) { Error(str); return 0; }
 
 //= Parser
 static int CurTok;
@@ -143,11 +170,6 @@ static int getTokPrecedence() {
   if (TokPrec <= 0) return -1;
   return TokPrec;
 }
-
-//== Error
-ExprAST *Error(const char *str) { fprintf(stderr, "Error: %s\n", str); return 0; }
-PrototypeAST *ErrorP(const char *str) { ErrorP(str); return 0; }
-FunctionAST *ErrorF(const char *str) { Error(str); return 0; }
 
 static ExprAST *ParseExpression();
 
@@ -300,26 +322,143 @@ static PrototypeAST *ParseExtern() {
   return ParsePrototype();
 }
 
-//= Top Level Parsing
+//= Code Generation
+static Module *TheModule;
+static IRBuilder<> Builder(getGlobalContext());
+static std::map<std::string, Value *> NamedValues;
+
+static void initLLVM() {
+  LLVMContext &Context = getGlobalContext();
+  TheModule = new Module("my cool jit", Context);
+}
+
+Value *NumberExprAST::Codegen() {
+  return ConstantFP::get(getGlobalContext(), APFloat(Val));
+}
+
+Value *VariableExprAST::Codegen() {
+  Value *V = NamedValues[Name];
+  return V ? V : ErrorV("Unknown variable name");
+}
+
+Value *BinaryExprAST::Codegen() {
+  Value *L = LHS->Codegen();
+  Value *R = RHS->Codegen();
+  if (L == 0 || R == 0) return 0;
+
+  switch (Op) {
+  case '+': return Builder.CreateFAdd(L, R, "addtmp");
+  case '-': return Builder.CreateFSub(L, R, "subtmp");
+  case '*': return Builder.CreateFMul(L, R, "multmp");
+  case '<':
+    L = Builder.CreateFCmpULT(L, R, "cmptmp");
+    return Builder.CreateUIToFP(L, Type::getDoubleTy(getGlobalContext()), "booltmp");
+
+  default: return ErrorV("invalid binary operator");
+  }
+}
+
+Value *CallExprAST::Codegen() {
+  Function *CalleeF = TheModule->getFunction(Callee);
+  if (CalleeF == 0)
+    return ErrorV("unknown function referenced");
+
+  if (CalleeF->arg_size() != Args.size())
+    return ErrorV("incorrect # arguments passed");
+
+  std::vector<Value *> ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]->Codegen());
+    if (ArgsV.back() == 0) return 0;
+  }
+
+  return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+Function *PrototypeAST::Codegen() {
+  std::vector<Type *> Doubles(Args.size(),
+                              Type::getDoubleTy(getGlobalContext()));
+  FunctionType *FT = FunctionType::get(Type::getDoubleTy(getGlobalContext()),
+                                       Doubles,
+                                       false);
+  Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule);
+
+  // conflicted, redefinition or reextern
+  if (F->getName() != Name) {
+    F->eraseFromParent();
+    F = TheModule->getFunction(Name);
+
+    if (!F->empty()) {
+      ErrorF("redefinition of function");
+      return 0;
+    }
+
+    if (F->arg_size() != Args.size()) {
+      ErrorF("redefinition of function with different # args");
+      return 0;
+    }
+  }
+
+  unsigned Idx = 0;
+  for (Function::arg_iterator AI = F->arg_begin(); Idx != Args.size(); ++AI, ++Idx) {
+    AI->setName(Args[Idx]);
+    NamedValues[Args[Idx]] = AI;
+  }
+
+  return F;
+}
+
+Function *FunctionAST::Codegen() {
+  NamedValues.clear();
+
+  Function *TheFunction = Proto->Codegen();
+  if (TheFunction == 0)
+    return 0;
+
+  BasicBlock *BB = BasicBlock::Create(getGlobalContext(), "entry", TheFunction);
+  Builder.SetInsertPoint(BB);
+
+  if (Value *RetVal = Body->Codegen()) {
+    Builder.CreateRet(RetVal);
+
+    verifyFunction(*TheFunction);
+
+    return TheFunction;
+  }
+
+  TheFunction->eraseFromParent();
+  return 0;
+}
+
+//= Top Level Parsing and JIT Driver
 static void HandleDefinition() {
-  if (ParseDefinition()) {
-    fprintf(stderr, "Parsed a function definition.\n");
+  if (FunctionAST *F = ParseDefinition()) {
+    if (Function *LF = F->Codegen()) {
+      fprintf(stderr, "Read function definition:");
+      LF->dump();
+    }
   } else {
     getNextToken(); // skip current token
   }
 }
 
 static void HandleExtern() {
-  if (ParseExtern()) {
-    fprintf(stderr, "Parsed an extern\n");
+  if (PrototypeAST *P = ParseExtern()) {
+    if (Function *F = P->Codegen()) {
+      fprintf(stderr, "Read extern:");
+      F->dump();
+    }
   } else {
     getNextToken(); // skip current token
   }
 }
 
 static void HandleTopLevelExpression() {
-  if (ParseTopLevelExpr()) {
-    fprintf(stderr, "Parsed a top-level expression\n");
+  if (FunctionAST *F = ParseTopLevelExpr()) {
+    if (Function *LF = F->Codegen()) {
+      fprintf(stderr, "Read top-level expression:");
+      LF->dump();
+    }
   } else {
     getNextToken(); //  skip current token
   }
@@ -343,6 +482,14 @@ static void MainLoop() {
   }
 }
 
+//= Library functions
+
+//== pushcard
+extern "C"
+double putchard(double X) {
+  putchar((char)X);
+  return 0;
+}
 
 int main() {
   initBinopPrecedence();
@@ -350,7 +497,11 @@ int main() {
   fprintf(stdout, "ready> ");
   getNextToken(); // Prime the first token
 
+  initLLVM();
+
   MainLoop();
+
+  TheModule->dump();
 
   return 0;
 }
