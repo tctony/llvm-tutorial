@@ -28,7 +28,12 @@ enum Token {
   tok_def = -2,
   tok_extern = -3,
   tok_identifier = -4,
-  tok_number = -5
+  tok_number = -5,
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
+  tok_for = -9,
+  tok_in = -10
 };
 
 static std::string IdentifierStr;
@@ -47,6 +52,11 @@ static int gettok() {
 
     if (IdentifierStr == "def") return tok_def;
     if (IdentifierStr == "extern") return tok_extern;
+    if (IdentifierStr == "if") return tok_if;
+    if (IdentifierStr == "then") return tok_then;
+    if (IdentifierStr == "else") return tok_else;
+    if (IdentifierStr == "for") return tok_for;
+    if (IdentifierStr == "in") return tok_in;
     return tok_identifier;
   }
 
@@ -114,6 +124,24 @@ namespace {
   public:
     CallExprAST(const std::string &callee, std::vector<ExprAST *> &args)
       : Callee(callee), Args(args) {}
+    virtual Value *Codegen();
+  };
+
+  class IfExprAST : public ExprAST {
+    ExprAST *Cond, *Then, *Else;
+  public:
+    IfExprAST(ExprAST *cond, ExprAST *then, ExprAST *_else)
+      : Cond(cond), Then(then), Else(_else) {}
+    virtual Value *Codegen();
+  };
+
+  class ForExprAST : public ExprAST {
+    std::string VarName;
+    ExprAST *Start, *End, *Step, *Body;
+  public:
+    ForExprAST(const std::string &varname, ExprAST *start, ExprAST *end,
+               ExprAST *step, ExprAST *body)
+      : VarName(varname), Start(start), End(end), Step(step), Body(body) {}
     virtual Value *Codegen();
   };
 
@@ -220,16 +248,85 @@ static ExprAST *ParseParenExpr() {
   return V;
 }
 
+//== ifexpr ::= 'if' expression 'then' expression 'else' expression
+static ExprAST *ParseIfExpr() {
+  getNextToken(); // eat if
+
+  ExprAST *Cond = ParseExpression();
+  if (!Cond) return 0;
+
+  if (CurTok != tok_then)
+    return Error("expected then");
+  getNextToken(); // eat then
+
+  ExprAST *Then = ParseExpression();
+  if (!Then) return 0;
+
+  if (CurTok != tok_else)
+    return Error("expected else");
+
+  getNextToken(); // eat else
+
+  ExprAST *Else = ParseExpression();
+  if (!Else) return 0;
+
+  return new IfExprAST(Cond, Then, Else);
+}
+
+//== forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
+static ExprAST *ParseForExpr() {
+  getNextToken(); // eat for
+
+  if (CurTok != tok_identifier)
+    return Error("expected identifier after for");
+  std::string IdName = IdentifierStr;
+  getNextToken(); // eat identifier
+
+  if (CurTok != '=')
+    return Error("expected '=' after for");
+  getNextToken(); // eat =
+
+  ExprAST *Start = ParseExpression();
+  if (!Start) return 0;
+  if (CurTok != ',')
+    return Error("expected ',' after for start value");
+  getNextToken();
+
+  ExprAST *End = ParseExpression();
+  if (!End) return 0;
+
+  // optional step
+  ExprAST *Step = 0;
+  if (CurTok == ',') {
+    getNextToken();
+    Step = ParseExpression();
+    if (!Step) return 0;
+  }
+
+  if (CurTok != tok_in)
+    return Error("expected 'in' after 'for'");
+  getNextToken();
+
+  ExprAST *Body = ParseExpression();
+  if (!Body) return 0;
+
+  return new ForExprAST(IdName, Start, End, Step, Body);
+}
+
 //== primary
 //==   ::= identifierexpr
 //==   ::= numberexpr
 //==   ::= parenexpr
+//==   ::= ifexpr
+//==   ::= forexpr
 static ExprAST *ParsePrimary() {
   switch (CurTok) {
   case tok_identifier: return ParseIdentifierExpr();
   case tok_number:     return ParseNumberExpr();
   case '(':            return ParseParenExpr();
-  default:             return Error("unknown token when expecting an expresion");
+  case tok_if:         return ParseIfExpr();
+  case tok_for:        return ParseForExpr();
+  default:             return Error("unknown token when expecting an expression");
   }
 }
 
@@ -368,6 +465,101 @@ Value *CallExprAST::Codegen() {
   }
 
   return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+Value *IfExprAST::Codegen() {
+  Value *CondV = Cond->Codegen();
+  if (CondV == 0) return 0;
+
+  CondV = Builder.CreateFCmpONE(CondV,
+                                ConstantFP::get(getGlobalContext(), APFloat(0.0)),
+                                "ifcond");
+
+  Function *TheFunction = Builder.GetInsertBlock()->getParent();
+  BasicBlock *ThenBB = BasicBlock::Create(getGlobalContext(), "then", TheFunction);
+  BasicBlock *ElseBB = BasicBlock::Create(getGlobalContext(), "else");
+  BasicBlock *MergeBB = BasicBlock::Create(getGlobalContext(), "ifcont");
+
+  Builder.CreateCondBr(CondV, ThenBB, ElseBB);
+
+  // then
+  Builder.SetInsertPoint(ThenBB);
+  Value *ThenV = Then->Codegen();
+  if (ThenV == 0) return 0;
+  Builder.CreateBr(MergeBB);
+  ThenBB = Builder.GetInsertBlock(); // update then phi
+
+  // else
+  TheFunction->getBasicBlockList().push_back(ElseBB);
+  Builder.SetInsertPoint(ElseBB);
+  Value *ElseV = Else->Codegen();
+  if (ElseV == 0) return 0;
+  Builder.CreateBr(MergeBB);
+  ElseBB = Builder.GetInsertBlock(); // update else phi
+
+  TheFunction->getBasicBlockList().push_back(MergeBB);
+  Builder.SetInsertPoint(MergeBB);
+  PHINode *PN = Builder.CreatePHI(Type::getDoubleTy(getGlobalContext()),
+                                  2,
+                                  "iftmp");
+  PN->addIncoming(ThenV, ThenBB);
+  PN->addIncoming(ElseV, ElseBB);
+  return PN;
+}
+
+Value *ForExprAST::Codegen() {
+  Value *StartVal = Start->Codegen();
+  if (!StartVal) return 0;
+
+  Function *TheFunction = Builder.GetInsertBlock()->getParent();
+  BasicBlock *PreheaderBB = Builder.GetInsertBlock();
+  BasicBlock *LoopBB = BasicBlock::Create(getGlobalContext(), "loop", TheFunction);
+  Builder.CreateBr(LoopBB);
+
+  Builder.SetInsertPoint(LoopBB);
+  PHINode *Variable = Builder.CreatePHI(Type::getDoubleTy(getGlobalContext()),
+                                        2,
+                                        VarName.c_str());
+  Variable->addIncoming(StartVal, PreheaderBB);
+
+  Value *OldVal = NamedValues[VarName];
+  NamedValues[VarName] = Variable;
+
+  if (Body->Codegen() == 0) return 0;
+
+  Value *StepVal;
+  if (Step) {
+    StepVal = Step->Codegen();
+    if (!StepVal) return 0;
+  } else {
+    StepVal = ConstantFP::get(getGlobalContext(), APFloat(1.0));
+  }
+
+  Value *NextVar = Builder.CreateFAdd(Variable, StepVal, "nextvar");
+
+  Value *EndCond = End->Codegen();
+  if (!EndCond) return 0;
+
+  EndCond = Builder.CreateFCmpONE(EndCond,
+                                  ConstantFP::get(getGlobalContext(), APFloat(0.0)),
+                                  "loopcond");
+
+  BasicBlock *LoopEndBB = Builder.GetInsertBlock();
+  BasicBlock *AfterBB = BasicBlock::Create(getGlobalContext(),
+                                           "afterloop",
+                                           TheFunction);
+
+  Builder.CreateCondBr(EndCond, LoopBB, AfterBB);
+
+  Builder.SetInsertPoint(AfterBB);
+  Variable->addIncoming(NextVar, LoopEndBB);
+
+  if (OldVal)
+    NamedValues[VarName] = OldVal;
+  else
+    NamedValues.erase(VarName);
+
+  return Constant::getNullValue(Type::getDoubleTy(getGlobalContext()));
 }
 
 Function *PrototypeAST::Codegen() {
