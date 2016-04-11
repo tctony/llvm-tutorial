@@ -541,11 +541,8 @@ static FunctionAST *ParseDefinition() {
 
 //== toplevelexpr ::= expression
 static FunctionAST *ParseTopLevelExpr() {
-  static int count = 0;
-  static char buffer[20];
   if (ExprAST *E = ParseExpression()) {
-    sprintf(buffer, "_toplevelexpr_%d", count++);
-    PrototypeAST *Proto = new PrototypeAST(std::string(buffer), std::vector<std::string>());
+    PrototypeAST *Proto = new PrototypeAST("main", std::vector<std::string>());
     return new FunctionAST(Proto, E);
   }
   return 0;
@@ -683,7 +680,6 @@ Value *IfExprAST::Codegen() {
 
 static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
                                           const std::string &VarName) {
-  fprintf(stderr, "fuck: %d", 1);
   IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
                    TheFunction->getEntryBlock().begin());
   return TmpB.CreateAlloca(Type::getDoubleTy(getGlobalContext()),
@@ -857,9 +853,8 @@ static ExecutionEngine *TheExecutionEngine;
 
 static void HandleDefinition() {
   if (FunctionAST *F = ParseDefinition()) {
-    if (Function *LF = F->Codegen()) {
-      fprintf(stderr, "Read function definition:");
-      LF->dump();
+    if (!F->Codegen()) {
+      fprintf(stderr, "error generating code for def");
     }
   } else {
     getNextToken(); // skip current token
@@ -868,9 +863,8 @@ static void HandleDefinition() {
 
 static void HandleExtern() {
   if (PrototypeAST *P = ParseExtern()) {
-    if (Function *F = P->Codegen()) {
-      fprintf(stderr, "Read extern:");
-      F->dump();
+    if (!P->Codegen()) {
+      fprintf(stderr, "error generating code for extern");
     }
   } else {
     getNextToken(); // skip current token
@@ -879,22 +873,8 @@ static void HandleExtern() {
 
 static void HandleTopLevelExpression() {
   if (FunctionAST *F = ParseTopLevelExpr()) {
-    if (Function *LF = F->Codegen()) {
-      fprintf(stderr, "Read top-level expression:");
-      LF->dump();
-
-      TheExecutionEngine->finalizeObject();
-
-      void *FPtr = TheExecutionEngine->getPointerToFunction(LF); // only get right pointer on first call, wtf!
-      if (FPtr > 0) {
-        double (*FP)() = (double (*)())FPtr;
-        fprintf(stderr, "evaluated to %f\n", FP());
-      }
-      else {
-        char buffer[100];
-        sprintf(buffer, "get function address (%p) for %p", FPtr, (void *)LF);
-        ErrorF(buffer);
-      }
+    if (!F->Codegen()) {
+      fprintf(stderr, "error generating code for top level expr");
     }
   } else {
     getNextToken(); //  skip current token
@@ -904,8 +884,6 @@ static void HandleTopLevelExpression() {
 //== top ::= definition | external | expression | ';'
 static void MainLoop() {
   while (1) {
-    fprintf(stdout, "ready> ");
-
   ready:
     switch(CurTok) {
     case tok_def:     HandleDefinition(); break;
@@ -943,7 +921,7 @@ int main() {
   InitializeNativeTargetAsmParser();
   LLVMContext &Context = getGlobalContext();
 
-  std::unique_ptr<Module> Owner = make_unique<Module>("my cool jit", Context);
+  std::unique_ptr<Module> Owner = make_unique<Module>("", Context);
   TheModule = Owner.get();
 
   std::string ErrStr;
@@ -958,16 +936,17 @@ int main() {
 
   FunctionPassManager OurFPM(TheModule);
   OurFPM.add(new DataLayoutPass());
+#if 0
   OurFPM.add(createBasicAliasAnalysisPass());
   OurFPM.add(createPromoteMemoryToRegisterPass());
   OurFPM.add(createInstructionCombiningPass());
   OurFPM.add(createReassociatePass());
   OurFPM.add(createGVNPass());
   OurFPM.add(createCFGSimplificationPass());
+#endif
   OurFPM.doInitialization();
   TheFPM = &OurFPM;
 
-  fprintf(stdout, "ready> ");
   getNextToken(); // Prime the first token
 
   MainLoop();
