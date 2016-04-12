@@ -20,6 +20,11 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Transforms/Scalar.h"
 
+#include <iostream>
+#include "llvm/ADT/Triple.h"
+#include "llvm/IR/DIBuilder.h"
+#include "llvm/Support/Host.h"
+
 using namespace llvm;
 
 //= Lexer
@@ -41,16 +46,34 @@ enum Token {
 
 static std::string IdentifierStr;
 static double NumVal;
+struct SourceLocation {
+  int Line;
+  int Col;
+};
+static SourceLocation CurLoc;
+static SourceLocation LexLoc = { 1, 0 };
+
+static int advance() {
+  int LastChar = getchar();
+
+  if (LastChar == '\n' || LastChar == '\r') {
+    LexLoc.Line++;
+    LexLoc.Col = 0;
+  } else {
+    LexLoc.Col++;
+  }
+  return LastChar;
+}
 
 static int gettok() {
   static int LastChar = ' ';
 
   while (isspace(LastChar))
-    LastChar = getchar();
+    LastChar = advance();
 
   if (isalpha(LastChar)) {
     IdentifierStr = LastChar;
-    while (isalnum((LastChar = getchar())))
+    while (isalnum((LastChar = advance())))
       IdentifierStr += LastChar;
 
     if (IdentifierStr == "def") return tok_def;
@@ -70,7 +93,7 @@ static int gettok() {
     IdentifierStr = "";
     do {
       IdentifierStr += LastChar;
-      LastChar = getchar();
+      LastChar = advance();
     } while (isdigit(LastChar) || LastChar == '.');
 
     NumVal = strtod(IdentifierStr.c_str(), 0);
@@ -78,7 +101,7 @@ static int gettok() {
   }
 
   if (LastChar == '#') {
-    do LastChar = getchar();
+    do LastChar = advance();
     while (LastChar != EOF && LastChar != '\n' && LastChar != '\r');
 
     if (LastChar != EOF)
@@ -89,85 +112,153 @@ static int gettok() {
     return tok_eof;
 
   int ThisChar = LastChar;
-  LastChar = getchar();
+  LastChar = advance();
   return ThisChar;
 }
 
 //= AST
 namespace {
+
+  std::ostream &indent(std::ostream &O, int size) {
+    return O << std::string(size, ' ');
+  }
+
   class ExprAST {
+    SourceLocation Loc;
+
   public:
+    int getLine() const { return Loc.Line; }
+    int getCol() const { return Loc.Col; }
+    ExprAST(SourceLocation loc = CurLoc) : Loc(loc) {}
+    virtual std::ostream &dump(std::ostream &out, int ind) {
+      return out << ':' << getLine() << ':' << getCol() << '\n';
+    }
     virtual ~ExprAST() {}
     virtual Value *Codegen() = 0;
   };
 
   class NumberExprAST : public ExprAST {
     double Val;
+
   public:
     NumberExprAST(double val) : Val(val) {}
+    virtual std::ostream &dump(std::ostream &out, int ind) {
+      return ExprAST::dump(out << Val, ind);
+    }
     virtual Value *Codegen();
   };
 
   class VariableExprAST : public ExprAST {
     std::string Name;
+
   public:
-    VariableExprAST(const std::string &name) : Name(name) {}
+    VariableExprAST(SourceLocation Loc, const std::string &name)
+      : ExprAST(Loc), Name(name) {}
     const std::string &getName() const { return Name; }
+    virtual std::ostream &dump(std::ostream &out, int ind) {
+      return ExprAST::dump(out << Name, ind);
+    }
     virtual Value *Codegen();
   };
 
   class UnaryExprAST : public ExprAST {
     char Op;
     ExprAST *Operand;
+
   public:
     UnaryExprAST(char op, ExprAST *operand)
       : Op(op), Operand(operand) {}
+    virtual std::ostream &dump(std::ostream &out, int ind) {
+      ExprAST::dump(out << "unary" << Op, ind);
+      Operand->dump(out, ind + 1);
+      return out;
+    }
     virtual Value *Codegen();
   };
 
   class BinaryExprAST : public ExprAST {
     char Op;
     ExprAST *LHS, *RHS;
+
   public:
-    BinaryExprAST(char op, ExprAST *lhs, ExprAST *rhs)
-      : Op(op), LHS(lhs), RHS(rhs) {}
+    BinaryExprAST(SourceLocation Loc, char op, ExprAST *lhs, ExprAST *rhs)
+      : ExprAST(Loc), Op(op), LHS(lhs), RHS(rhs) {}
+    virtual std::ostream &dump(std::ostream &out, int ind) {
+      ExprAST::dump(out << "binary" << Op, ind);
+      LHS->dump(indent(out, ind) << "LHS:", ind + 1);
+      RHS->dump(indent(out, ind) << "RHS:", ind + 1);
+      return out;
+    }
     virtual Value *Codegen();
   };
 
   class CallExprAST : public ExprAST {
     std::string Callee;
     std::vector<ExprAST *> Args;
+
   public:
-    CallExprAST(const std::string &callee, std::vector<ExprAST *> &args)
-      : Callee(callee), Args(args) {}
+    CallExprAST(SourceLocation Loc, const std::string &callee,
+                std::vector<ExprAST *> &args)
+      : ExprAST(Loc), Callee(callee), Args(args) {}
+    virtual std::ostream &dump(std::ostream &out, int ind) {
+      ExprAST::dump(out << "call " << Callee, ind);
+      for (ExprAST *Arg : Args)
+        Arg->dump(indent(out, ind + 1), ind + 1);
+      return out;
+    }
     virtual Value *Codegen();
   };
 
   class IfExprAST : public ExprAST {
     ExprAST *Cond, *Then, *Else;
+
   public:
-    IfExprAST(ExprAST *cond, ExprAST *then, ExprAST *_else)
-      : Cond(cond), Then(then), Else(_else) {}
+    IfExprAST(SourceLocation Loc, ExprAST *cond, ExprAST *then, ExprAST *_else)
+      : ExprAST(Loc), Cond(cond), Then(then), Else(_else) {}
+    virtual std::ostream &dump(std::ostream &out, int ind) {
+      ExprAST::dump(out << "if", ind);
+      Cond->dump(indent(out, ind) << "Cond:", ind + 1);
+      Then->dump(indent(out, ind) << "Then:", ind + 1);
+      Else->dump(indent(out, ind) << "Else:", ind + 1);
+      return out;
+    }
     virtual Value *Codegen();
   };
 
   class ForExprAST : public ExprAST {
     std::string VarName;
     ExprAST *Start, *End, *Step, *Body;
+
   public:
     ForExprAST(const std::string &varname, ExprAST *start, ExprAST *end,
                ExprAST *step, ExprAST *body)
       : VarName(varname), Start(start), End(end), Step(step), Body(body) {}
+    virtual std::ostream &dump(std::ostream &out, int ind) {
+      ExprAST::dump(out << "for", ind);
+      Start->dump(indent(out, ind) << "Cond:", ind + 1);
+      End->dump(indent(out, ind) << "End:", ind + 1);
+      Step->dump(indent(out, ind) << "Step:", ind + 1);
+      Body->dump(indent(out, ind) << "Body:", ind + 1);
+      return out;
+    }
     virtual Value *Codegen();
   };
 
   class VarExprAST : public ExprAST {
     std::vector<std::pair<std::string, ExprAST *> > VarNames;
     ExprAST *Body;
+
   public:
     VarExprAST(const std::vector<std::pair<std::string, ExprAST *> > &varnames,
                ExprAST *body)
       : VarNames(varnames), Body(body) {}
+    virtual std::ostream &dump(std::ostream &out, int ind) {
+      ExprAST::dump(out << "var", ind);
+      for (const auto &NamedVar : VarNames)
+        NamedVar.second->dump(indent(out, ind) << NamedVar.first << ':', ind + 1);
+      Body->dump(indent(out, ind) << "Body:", ind + 1);
+      return out;
+    }
     virtual Value *Codegen();
   };
 
@@ -176,10 +267,13 @@ namespace {
     std::vector<std::string> Args;
     bool isOperator;
     unsigned Precedence;  // Precedence for binary op
+    int Line;
+
   public:
-    PrototypeAST(const std::string &name, const std::vector<std::string> &args,
+    PrototypeAST(SourceLocation Loc, const std::string &name, const std::vector<std::string> &args,
                  bool isoperator = false, unsigned prec = 0)
-      : Name(name), Args(args), isOperator(isoperator), Precedence(prec) {}
+      : Name(name), Args(args), isOperator(isoperator), Precedence(prec),
+        Line(Loc.Line) {}
 
     bool isUnaryOp() const { return isOperator && Args.size() == 1; }
     bool isBinaryOp() const { return isOperator && Args.size() == 2; }
@@ -192,6 +286,7 @@ namespace {
     Function *Codegen();
 
     void CreateArgumentAllocas(Function *F);
+    const std::vector<std::string> &getArgs() const { return Args; }
   };
 
   class FunctionAST {
@@ -200,6 +295,14 @@ namespace {
   public:
     FunctionAST(PrototypeAST *proto, ExprAST *body)
       : Proto(proto), Body(body) {}
+
+    std::ostream &dump(std::ostream &out, int ind) {
+      indent(out, ind) << "FunctionAST\n";
+      ++ind;
+      indent(out, ind) << "Body:";
+      return Body ? Body->dump(out, ind) : out << "null\n";
+    }
+
     Function *Codegen();
   };
 }
@@ -244,10 +347,12 @@ static ExprAST *ParseExpression();
 static ExprAST *ParseIdentifierExpr() {
   std::string IdName = IdentifierStr;
 
+  SourceLocation LitLoc = CurLoc;
+
   getNextToken(); // eat identifier
 
   if (CurTok != '(')
-    return new VariableExprAST(IdName);
+    return new VariableExprAST(LitLoc, IdName);
 
   getNextToken(); // eat (
   std::vector<ExprAST *> Args;
@@ -267,7 +372,7 @@ static ExprAST *ParseIdentifierExpr() {
 
   getNextToken(); // eat )
 
-  return new CallExprAST(IdName, Args);
+  return new CallExprAST(LitLoc, IdName, Args);
 }
 
 //== numberexpr ::= number
@@ -291,6 +396,8 @@ static ExprAST *ParseParenExpr() {
 
 //== ifexpr ::= 'if' expression 'then' expression 'else' expression
 static ExprAST *ParseIfExpr() {
+  SourceLocation IfLoc = CurLoc;
+
   getNextToken(); // eat if
 
   ExprAST *Cond = ParseExpression();
@@ -311,7 +418,7 @@ static ExprAST *ParseIfExpr() {
   ExprAST *Else = ParseExpression();
   if (!Else) return 0;
 
-  return new IfExprAST(Cond, Then, Else);
+  return new IfExprAST(IfLoc, Cond, Then, Else);
 }
 
 //== forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
@@ -440,6 +547,7 @@ static ExprAST *ParseBinOpRHS(int ExprPrec, ExprAST *LHS) {
       return LHS;
 
     int BinOp = CurTok;
+    SourceLocation BinLoc = CurLoc;
     getNextToken(); // eat binop
 
     ExprAST *RHS = ParseUnary();
@@ -451,7 +559,7 @@ static ExprAST *ParseBinOpRHS(int ExprPrec, ExprAST *LHS) {
       if (!RHS) return 0;
     }
 
-    LHS = new BinaryExprAST(BinOp, LHS, RHS);
+    LHS = new BinaryExprAST(BinLoc, BinOp, LHS, RHS);
   }
 }
 
@@ -470,6 +578,8 @@ static ExprAST *ParseExpression() {
 //==   ::= binary LETTER number? (id, id)
 static PrototypeAST *ParsePrototype() {
   std::string FnName;
+
+  SourceLocation FnLoc = CurLoc;
 
   unsigned Kind = 0;    // 0 = identifier, 1 = unary, 2 = binary
   unsigned BinaryPrecedence = 30;
@@ -524,7 +634,7 @@ static PrototypeAST *ParsePrototype() {
   if (Kind && ArgNames.size() != Kind)
     return ErrorP("invalid number of operands for operators");
 
-  return new PrototypeAST(FnName, ArgNames, Kind > 0, BinaryPrecedence);
+  return new PrototypeAST(FnLoc, FnName, ArgNames, Kind > 0, BinaryPrecedence);
 }
 
 //== definition ::= 'def' prototype expression
@@ -541,8 +651,9 @@ static FunctionAST *ParseDefinition() {
 
 //== toplevelexpr ::= expression
 static FunctionAST *ParseTopLevelExpr() {
+  SourceLocation FnLoc = CurLoc;
   if (ExprAST *E = ParseExpression()) {
-    PrototypeAST *Proto = new PrototypeAST("main", std::vector<std::string>());
+    PrototypeAST *Proto = new PrototypeAST(FnLoc, "main", std::vector<std::string>());
     return new FunctionAST(Proto, E);
   }
   return 0;
@@ -560,7 +671,51 @@ static IRBuilder<> Builder(getGlobalContext());
 static std::map<std::string, AllocaInst *> NamedValues;
 static FunctionPassManager *TheFPM;
 
+static DIBuilder *DBuilder;
+struct DebugInfo {
+  DICompileUnit TheCU;
+  DIType DblTy;
+  std::vector<DIScope *> LexicalBlocks;
+  std::map<const PrototypeAST *, DIScope> FnScopeMap;
+
+  void emitLocation(ExprAST *AST);
+  DIType getDoubleTy();
+} KSDbgInfo;
+
+void DebugInfo::emitLocation(ExprAST *AST) {
+  if (!AST)
+    return Builder.SetCurrentDebugLocation(DebugLoc());
+  DIScope *Scope;
+  if (LexicalBlocks.empty())
+    Scope = &TheCU;
+  else
+    Scope = LexicalBlocks.back();
+  Builder.SetCurrentDebugLocation(DebugLoc::get(AST->getLine(), AST->getCol(), DIScope(*Scope)));
+}
+
+DIType DebugInfo::getDoubleTy() {
+  if (DblTy.isValid())
+    return DblTy;
+
+  DblTy = DBuilder->createBasicType("double", 64, 64, dwarf::DW_ATE_float);
+  return DblTy;
+}
+
+static DICompositeType CreateFunctionType(unsigned NumArgs, DIFile Unit) {
+  SmallVector<Metadata *, 8> EltTys;
+  DIType DblTy = KSDbgInfo.getDoubleTy();
+
+  EltTys.push_back(DblTy);
+
+  for (unsigned i = 0, e = NumArgs; i != e; ++i)
+    EltTys.push_back(DblTy);
+
+  DITypeArray EltTypeArray = DBuilder->getOrCreateTypeArray(EltTys);
+  return DBuilder->createSubroutineType(Unit, EltTypeArray);
+}
+
 Value *NumberExprAST::Codegen() {
+  KSDbgInfo.emitLocation(this);
   return ConstantFP::get(getGlobalContext(), APFloat(Val));
 }
 
@@ -568,6 +723,7 @@ Value *VariableExprAST::Codegen() {
   Value *V = NamedValues[Name];
   if (V == 0) return ErrorV("Unknown variable name");
 
+  KSDbgInfo.emitLocation(this);
   return Builder.CreateLoad(V, Name.c_str());
 }
 
@@ -579,10 +735,13 @@ Value *UnaryExprAST::Codegen() {
   if (F == 0)
     return ErrorV("unknown unary operator");
 
+  KSDbgInfo.emitLocation(this);
   return Builder.CreateCall(F, OperandV, "unop");
 }
 
 Value *BinaryExprAST::Codegen() {
+  KSDbgInfo.emitLocation(this);
+
   if (Op == '=') {
     VariableExprAST *LHSE = dynamic_cast<VariableExprAST *>(LHS);
     if (!LHSE)
@@ -622,6 +781,8 @@ Value *BinaryExprAST::Codegen() {
 }
 
 Value *CallExprAST::Codegen() {
+  KSDbgInfo.emitLocation(this);
+
   Function *CalleeF = TheModule->getFunction(Callee);
   if (CalleeF == 0)
     return ErrorV("unknown function referenced");
@@ -639,6 +800,8 @@ Value *CallExprAST::Codegen() {
 }
 
 Value *IfExprAST::Codegen() {
+  KSDbgInfo.emitLocation(this);
+
   Value *CondV = Cond->Codegen();
   if (CondV == 0) return 0;
 
@@ -691,6 +854,8 @@ Value *ForExprAST::Codegen() {
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
 
   AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+
+  KSDbgInfo.emitLocation(this);
 
   Value *StartVal = Start->Codegen();
   if (!StartVal) return 0;
@@ -764,6 +929,8 @@ Value *VarExprAST::Codegen() {
     NamedValues[VarName] = Alloca;
   }
 
+  KSDbgInfo.emitLocation(this);
+
   Value *BodyVal = Body->Codegen();
   if (!BodyVal) return 0;
 
@@ -798,9 +965,19 @@ Function *PrototypeAST::Codegen() {
   }
 
   unsigned Idx = 0;
-  for (Function::arg_iterator AI = F->arg_begin(); Idx != Args.size(); ++AI, ++Idx) {
+  for (Function::arg_iterator AI = F->arg_begin(); Idx != Args.size(); ++AI, ++Idx)
     AI->setName(Args[Idx]);
-  }
+
+  DIFile Unit = DBuilder->createFile(KSDbgInfo.TheCU.getFilename(),
+                                     KSDbgInfo.TheCU.getDirectory());
+  DIDescriptor FContext(Unit);
+  unsigned LineNo = Line;
+  unsigned ScopeLine = Line;
+  DISubprogram SP = DBuilder->createFunction(FContext, Name, StringRef(), Unit, LineNo,
+                                             CreateFunctionType(Args.size(), Unit), false,
+                                             true, ScopeLine, DIDescriptor::FlagPrototyped,
+                                             false, F);
+  KSDbgInfo.FnScopeMap[this] = SP;
 
   return F;
 }
@@ -809,6 +986,19 @@ void PrototypeAST::CreateArgumentAllocas(Function *F) {
   Function::arg_iterator AI = F->arg_begin();
   for (unsigned Idx = 0, e = Args.size(); Idx != e; ++Idx, ++AI) {
     AllocaInst *Alloca = CreateEntryBlockAlloca(F, Args[Idx]);
+
+    DIScope *Scope = KSDbgInfo.LexicalBlocks.back();
+    DIFile Unit = DBuilder->createFile(KSDbgInfo.TheCU.getFilename(),
+                                       KSDbgInfo.TheCU.getDirectory());
+    DIVariable D  =  DBuilder->createLocalVariable(dwarf::DW_TAG_arg_variable,
+                                                   *Scope, Args[Idx], Unit, Line,
+                                                   KSDbgInfo.getDoubleTy(), Idx);
+
+    Instruction *Call = DBuilder->insertDeclare(Alloca, D,
+                                                DBuilder->createExpression(),
+                                                Builder.GetInsertBlock());
+    Call->setDebugLoc(DebugLoc::get(Line, 0, *Scope));
+
     Builder.CreateStore(AI, Alloca);
     NamedValues[Args[Idx]] = Alloca;
   }
@@ -821,6 +1011,9 @@ Function *FunctionAST::Codegen() {
   if (TheFunction == 0)
     return 0;
 
+  KSDbgInfo.LexicalBlocks.push_back(&KSDbgInfo.FnScopeMap[Proto]);
+  KSDbgInfo.emitLocation(nullptr);
+
   if (Proto->isBinaryOp())
     BinopPrecedence[Proto->getOperatorName()] = Proto->getBinaryPrecedence();
 
@@ -831,6 +1024,8 @@ Function *FunctionAST::Codegen() {
 
   if (Value *RetVal = Body->Codegen()) {
     Builder.CreateRet(RetVal);
+
+    KSDbgInfo.LexicalBlocks.pop_back();
 
     verifyFunction(*TheFunction);
 
@@ -843,6 +1038,8 @@ Function *FunctionAST::Codegen() {
 
   if (Proto->isBinaryOp())
     BinopPrecedence.erase(Proto->getOperatorName());
+
+  KSDbgInfo.LexicalBlocks.pop_back();
 
   return 0;
 }
@@ -924,6 +1121,21 @@ int main() {
   std::unique_ptr<Module> Owner = make_unique<Module>("", Context);
   TheModule = Owner.get();
 
+  TheModule->addModuleFlag(Module::Warning, "Debug Info Version",
+                           DEBUG_METADATA_VERSION);
+
+  if (Triple(sys::getProcessTriple()).isOSDarwin())
+    TheModule->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 2);
+
+  DBuilder = new DIBuilder(*TheModule);
+  KSDbgInfo.TheCU = DBuilder->createCompileUnit(dwarf::DW_LANG_C,
+                                                "fib.ks",
+                                                ".",
+                                                "Kaleidoscope Compiler",
+                                                0,
+                                                "",
+                                                0);
+
   std::string ErrStr;
   TheExecutionEngine = EngineBuilder(std::move(Owner))
     .setErrorStr(&ErrStr)
@@ -952,6 +1164,7 @@ int main() {
   MainLoop();
 
   TheFPM = 0;
+  DBuilder->finalize();
   TheModule->dump();
 
   return 0;
